@@ -42,7 +42,20 @@ class Conv(BaseLayer):
 
 
     def forward(self, input_tensor):
+
         self.input_tensor = input_tensor
+        print(self.input_tensor.shape)
+        if self.dim1:
+            # Get the batch size and number of channels from the input tensor shape
+            batch_size, num_channels, input_length = input_tensor.shape
+
+            # Reshape the input tensor to have shape (batch_size, num_channels * input_length)
+            self.input_tensor = np.reshape(input_tensor, (batch_size, num_channels * input_length))
+
+
+        else:
+            batch_size, num_channels, input_height, input_width = input_tensor.shape
+            self.input_tensor = np.reshape(input_tensor, (batch_size, num_channels * input_height * input_width))
 
         # Calculate output shape with same padding
         output_height = (input_tensor.shape[2] + 2 * (self.convolution_shape[0] // 2) - self.convolution_shape[0]) // self.stride_shape[0] + 1
