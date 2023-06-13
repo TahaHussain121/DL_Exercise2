@@ -1,145 +1,249 @@
+from Layers import Base
 import numpy as np
-import scipy
-from scipy.signal import correlate, correlate2d
+from scipy.signal import fftconvolve, correlate, correlate2d
 
-from Layers.Base import BaseLayer
-
-
-class Conv(BaseLayer):
+class Conv(Base.BaseLayer):
 
     def __init__(self, stride_shape, convolution_shape, num_kernels):
-
-        self.output_shape = None
-        self.input_tensor = None
-        self.padded_input = None
+        super().__init__()
+        self.trainable = True
         self.stride_shape = stride_shape
+        print('stride_shape = ', self.stride_shape)
+        self._optimizer = None
         self.convolution_shape = convolution_shape
         self.num_kernels = num_kernels
-        self.stride_row = self.stride_shape[0]
-        self.stride_col = self.stride_shape[1]
-        self.convolution_row_shape = convolution_shape[1]
-        self.convolution_col_shape = convolution_shape[2]
-        self.dim1 = False
-        self.trainable = True
-
-        # Initialize weights and biases
-        if len(convolution_shape) == 2:  # 1D convolution
-            c, m = convolution_shape
-            self.weights = np.random.uniform(size=(num_kernels, c, m))
-            self.dim1 = True
-        elif len(convolution_shape) == 3:  # 2D convolution
-            c, m, n = convolution_shape
-            self.dim1 = False
-            self.stride_col = 1
-            self.convolution_col_shape = 1
-            self.weights = np.random.uniform(size=(num_kernels, c, m, n))
-
-        self.bias = np.random.uniform(size=(num_kernels,))
-        self._optimizer = None  # weight optimizer
-        self._bias_optimizer = None
-        self._gradient_weights = np.zeros_like(self.weights)
-        self._gradient_bias = None
-
+        self.weights = np.array([list(np.random.random(self.convolution_shape)) for k in range(self.num_kernels)])
+        self.bias = np.random.random(self.num_kernels)
+        self.input_tensor_shape = None
+        self.input_tensor = None
+        self.gradient_kernels = None
+        self.output_of_forward = None
+        self.gradient_b = None
 
     def forward(self, input_tensor):
-
+        #print('input_tensor.shape = ', input_tensor.shape, '\ninput_tensor\n', input_tensor)
         self.input_tensor = input_tensor
-        print(self.input_tensor.shape)
-        if self.dim1:
-            # Get the batch size and number of channels from the input tensor shape
-            batch_size, num_channels, input_length = input_tensor.shape
+        self.input_tensor_shape = input_tensor.shape
+        # output convolution array: 1dim -> contains the batch elements of inpout_tensor,
+        #                           2dim -> contains the batch elements of the self.weights,
+        #                           3dim -> contains the y axis elements of the input_tensor,
+        #                           4dim -> contains the x axis elements of the input_tensor, this dim must not always exist -> if clause needed
 
-            # Reshape the input tensor to have shape (batch_size, num_channels * input_length)
-            self.input_tensor = np.reshape(input_tensor, (batch_size, num_channels * input_length))
+        # list for appending all the batch elements of the input tensor
+        # conv_array includes the strides
+        conv_array = []
+        # output_without_stride is the output of forward wihtout strides
+        #output_without_stride = []
+        # iterate over the input_tensor batch
+        for b in range(0, input_tensor.shape[0]):
+            # list for appending all the batch elements of weight array
+            conv_list = []
+            #conv_list_without_stride = []
+            # iterate over the weight batch
+            for batch_weights_index in range(0, self.num_kernels):
+                #print('\ninput_tensor[b]\n', input_tensor[b], '\n\nself.weights.shape[0] aka batch shape\n', self.weights.shape[0])
+                temp = 0
+                # convolute with mode same per depth, then add the outputs together
+                for depth_index in range(0, input_tensor.shape[1]):
+                    #why = np.flip(self.weights[batch_weights_index][depth_index])
+                    temp += correlate(input_tensor[b][depth_index], self.weights[batch_weights_index][depth_index], mode='same')
 
+                # adding bias
+                temp += self.bias[batch_weights_index]
+                #conv_list_without_stride.append(temp)
+                if self.stride_shape[0] > 1 or self.stride_shape[1] > 1:
+                    # we have to take the stripes depending on the shape of input_tensor being (depth,y) or (depth,y,x)
+                    if len(input_tensor.shape) == 3:
+                        # for some reason stride shape give can be either [x] or (x,y), no clue why the datatype is different
+                        # -> we need another if clause
+                        if len(self.stride_shape) == 1:
+                            #print('\nconvolution output after stride = \n', temp[::self.stride_shape[0]])
+                            conv_list.append(list(temp[::self.stride_shape[0]]))
+                            #print('\ncase1\n')
+                            continue
+                        else:
+                            print('ERROR: strid_shape is tuple of length 2 but input tensor has no width')
+                            continue
+                    else:
+                        if len(self.stride_shape) == 1:
+                            conv_list.append(list(temp[::self.stride_shape[0], ::self.stride_shape[0]]))
+                            #print('case2')
+                            continue
+                        else:
+                            conv_list.append(list(temp[::self.stride_shape[0], ::self.stride_shape[1]]))
+                            #print('case3')
+                            continue
 
-        else:
-            batch_size, num_channels, input_height, input_width = input_tensor.shape
-            self.input_tensor = np.reshape(input_tensor, (batch_size, num_channels * input_height * input_width))
-
-        # Calculate output shape with same padding
-        output_height = (input_tensor.shape[2] + 2 * (self.convolution_shape[0] // 2) - self.convolution_shape[0]) // self.stride_shape[0] + 1
-        output_width = (input_tensor.shape[3] + 2 * (self.convolution_shape[1] // 2) - self.convolution_shape[1]) // self.stride_shape[1] + 1
-
-        # Initialize output tensor
-        output_tensor = np.zeros((input_tensor.shape[0], self.num_kernels, output_height, output_width))
-
-        # Perform correlation operation with same padding
-        for batch in range(input_tensor.shape[0]):
-            for kernel_idx in range(self.num_kernels):
-                for input_channel in range(input_tensor.shape[1]):
-                    output_tensor[batch, kernel_idx, :, :] += scipy.signal.correlate2d(
-                        input_tensor[batch, input_channel, :, :],
-                        self.weights[kernel_idx, input_channel, :, :],
-                        mode='same')
-
-                # Add bias term
-                output_tensor[batch, kernel_idx, :, :] += self.bias[kernel_idx]
-
-        # Apply stride and reshape
-        s_Row = int(np.ceil(output_tensor.shape[2] / self.stride_shape[0]))
-        s_Col = int(np.ceil(output_tensor.shape[3] / self.stride_shape[1]))
-        output_tensor_stride = np.zeros((input_tensor.shape[0], self.num_kernels, s_Row, s_Col))
-
-        for batch in range(input_tensor.shape[0]):
-            for kernel_idx in range(self.num_kernels):
-                for j in range(s_Row):
-                    for k in range(s_Col):
-                        j_in_output_tensor = j * self.stride_shape[0]
-                        k_in_output_tensor = k * self.stride_shape[1]
-                        output_tensor_stride[batch, kernel_idx, j, k] = output_tensor[
-                            batch, kernel_idx, j_in_output_tensor, k_in_output_tensor]
-
-        # Reshape output tensor based on dimensionality
-        if self.dim1:
-            output_tensor_with_stride = output_tensor_stride.reshape(
-                output_tensor_stride.shape[0],
-                output_tensor_stride.shape[1],
-                output_tensor_stride.shape[2])
-        else:
-            output_tensor_with_stride = output_tensor_stride.reshape(
-                output_tensor_stride.shape[0],
-                output_tensor_stride.shape[1],
-                output_tensor_stride.shape[2],
-                output_tensor_stride.shape[3])
-
-        self.output_shape = output_tensor_with_stride.shape  # store the output shape
-
-        return output_tensor_stride
+                conv_list.append(temp)
+            conv_array.append(conv_list)
+            #output_without_stride.append(conv_list_without_stride)
+        #self.output_of_forward = np.array(output_without_stride)
+        conv_array = np.array(conv_array)
+        #print('\nconvolution output array, should have a shape of (tensor batch, weight batch, convolution ouput length\n', conv_array)
+        return conv_array
 
     def backward(self, error_tensor):
-        pass
+        self.output_of_forward = error_tensor
+        #print('\nerror_tensor for backpropagation\n', error_tensor)
+        print('\nerror_tensor shape = ', error_tensor.shape, '\nkernel shape = ', self.weights.shape)
+        stride_bool = False
+
+        # list for appending all the batch elements of the input tensor
+        conv_array = []
+        # outmost list (batch axis) for grabbing just the padded error tensor
+        padded_error_list_alls_channels_batch = []
+        # iterate over the input_tensor batch
+        for b in range(0, error_tensor.shape[0]):
+            # list for appending all the batch elements of weight array
+            conv_list = []
+
+            # iterate over the weight batch
+            for depth_index in range(0, self.weights.shape[1]):
+                temp = 0
+                # list for grabbing just the padded error tensor
+                padded_error_list_all_channels = []
+                for batch_weights_index in range(0, self.num_kernels):
+                    # cross correlate with mode same per depth, then add the outputs together
+                    # but before decide if error tensor has x,y spatial dim or only x (we do this by checking the length of the error_tensor shape)
+                    padded_error_list = []
+                    if len(error_tensor.shape) == 3:
+                        # if self.stride > 1 we need to pad zeros back in to get the correct size so correlation can lead to the input.shape
+                        if self.stride_shape[0] > 1:
+                            stride_bool = True
+                            index_location = np.tile(np.arange(1, error_tensor[b][batch_weights_index].shape[0]), self.stride_shape[0]-1)
+                            padded_error_tensor = np.insert(error_tensor[b][batch_weights_index], index_location, np.zeros(error_tensor[b][batch_weights_index][index_location].shape))
+                            # the following line appears in every if clause, when stride is >1. It is saving the padded error tensor which is used in backward pass
+                            padded_error_list = padded_error_tensor.tolist()
+                        else:
+                            padded_error_tensor = error_tensor[b][batch_weights_index]
+
+                        temp += fftconvolve(padded_error_tensor, self.weights[self.weights.shape[0] - 1 - batch_weights_index][depth_index], mode='same')
+                    else:
+                        if self.stride_shape[0] > 1 or self.stride_shape[1] > 1:
+                            stride_bool = True
+                            # big problem in this whole ifclause: so far I only pad once on the outside to fit the input_tensor.shape,
+                            # it is highly likely that you need to fit more (e.g. [1,0,2,0,3,0,0,0]
+
+                            # padding on axis 0
+                            index_location = np.tile(np.arange(1, error_tensor[b][batch_weights_index].shape[0]), self.stride_shape[0] - 1)
+                            padded_error_tensor_x = np.insert(error_tensor[b][batch_weights_index], index_location, np.zeros(error_tensor[b][batch_weights_index][index_location].shape), axis=0)
+                            # special case that padding needs to be expanded on the outside of the array (e.g [1,0,2,0,3,0] <- here the 0 is padded outside)
+                            if padded_error_tensor_x.shape[0] != self.input_tensor_shape[2]:
+                                index_location = np.tile(np.arange(0, error_tensor[b][batch_weights_index].shape[0]), self.stride_shape[0] - 1)
+                                padded_error_tensor_x = np.insert(error_tensor[b][batch_weights_index], index_location, np.zeros(error_tensor[b][batch_weights_index][index_location].shape), axis=0)
+
+                            # padding on axis 1
+                            index_location = np.tile(np.arange(1, padded_error_tensor_x.shape[1]), self.stride_shape[1] - 1)
+                            padded_error_tensor_y = np.insert(padded_error_tensor_x, index_location, np.zeros(padded_error_tensor_x[1, index_location].shape), axis=1)
+                            padded_error_tensor = padded_error_tensor_y
+                            padded_error_list = padded_error_tensor.tolist()    # again this overrides the full error_tensor to the padded error_tensor because strides took place
+                            if padded_error_tensor_y.shape[1] != self.input_tensor_shape[3]:
+                                index_location = np.tile(np.arange(0, padded_error_tensor_x.shape[1]), self.stride_shape[1] - 1)
+                                padded_error_tensor = np.insert(padded_error_tensor_x, index_location, np.zeros(padded_error_tensor_x[1, index_location].shape), axis=1)
+                                padded_error_list = padded_error_tensor.tolist()    # again this overrides the full error_tensor to the padded error_tensor because strides took place
+                                #print('\npadded error tensor\n', padded_error_tensor)
+
+                        else:
+                            padded_error_tensor = error_tensor[b][batch_weights_index]
+                        #print('padded_error_tensor\n', padded_error_tensor)
+                        temp += fftconvolve(padded_error_tensor, self.weights[batch_weights_index][depth_index], mode='same')
+                    padded_error_list_all_channels.append(padded_error_list)
+                #print('\npadded_error_list_all_channels\n', padded_error_list_all_channels)
+                conv_list.append(list(temp))
+            padded_error_list_alls_channels_batch.append(padded_error_list_all_channels)
+            #print('\npadded_error_list_all_channels\n', padded_error_list_all_channels)
+            conv_array.append(conv_list)
+        conv_array = np.array(conv_array)
+
+        # if clause for when stride > 1, because then we need a padded error tensor
+        if stride_bool:
+            self.output_of_forward = np.array(padded_error_list_alls_channels_batch)
+            print('\npadded_error_list_all_channels_batch\n', self.output_of_forward.shape)
+
+        # -- Now compute the gradient kernels to update the existing kernels (see slide 22)
+
+        # check whether our kernel has 2 dim or 3 dim
+        flag_kernel_dim = True
+        if len(self.convolution_shape) == 2:
+            flag_kernel_dim = False
+            half_kernel_length = self.convolution_shape[1] // 2
+            # If the spatial dim is an even number you only pad on one side
+            if self.convolution_shape[1] % 2 == 0:
+                padded_input_tensor = np.pad(self.input_tensor, ((0, 0), (0, 0), (half_kernel_length - 1, half_kernel_length)))
+            else:
+                padded_input_tensor = np.pad(self.input_tensor, ((0, 0), (0, 0), (half_kernel_length, half_kernel_length)))
+        else:
+            # If one of the spatial dimensions of the kernel is an even number you have to pad unevenly in this corresponding side
+            if self.convolution_shape[1] % 2 == 0:
+                half_kernel_length = self.convolution_shape[1] // 2
+                half_kernel_width = self.convolution_shape[2] // 2
+                if flag_kernel_dim and self.convolution_shape[2] % 2 == 0:
+                    padded_input_tensor = np.pad(self.input_tensor, ((0, 0), (0, 0), (half_kernel_length-1, half_kernel_length), (half_kernel_width-1, half_kernel_width)))
+                else:
+                    padded_input_tensor = np.pad(self.input_tensor, ((0, 0), (0, 0), (half_kernel_length-1, half_kernel_length), (half_kernel_width, half_kernel_width)))
+            else:
+                half_kernel_length = self.convolution_shape[1] // 2
+                half_kernel_width = self.convolution_shape[2] // 2
+                padded_input_tensor = np.pad(self.input_tensor, ((0, 0), (0, 0), (half_kernel_length, half_kernel_length), (half_kernel_width, half_kernel_width)))
+
+            if flag_kernel_dim and self.convolution_shape[2] % 2 == 0:
+                half_kernel_length = self.convolution_shape[1] // 2
+                half_kernel_width = self.convolution_shape[2] // 2
+                if self.convolution_shape[1] % 2 == 0:
+                    padded_input_tensor = np.pad(self.input_tensor, ((0, 0), (0, 0), (half_kernel_length-1, half_kernel_length), (half_kernel_width-1, half_kernel_width)))
+                else:
+                    padded_input_tensor = np.pad(self.input_tensor, ((0, 0), (0, 0), (half_kernel_length, half_kernel_length), (half_kernel_width-1, half_kernel_width)))
+
+        print('input tensor shape = ', self.input_tensor.shape, 'padded input_tensor shape = ',
+              padded_input_tensor.shape, 'error tensor shape', self.output_of_forward.shape)
+
+        # here the actual gradient computation takes place (see slide 22)
+        gradient_kernels_batch = []
+        for b in range(0, self.input_tensor_shape[0]):
+            gradient_kernels = []
+            for index_kernels in range(0, self.num_kernels):
+                temp = []
+                for depth_index in range(0, self.input_tensor_shape[1]):
+                    why = correlate(padded_input_tensor[b][depth_index], self.output_of_forward[b][index_kernels], mode='valid')
+                    temp.append(why.tolist())
+
+                gradient_kernels.append(temp)
+            gradient_kernels_batch.append(gradient_kernels)
+        # all the gradients of all the kernels for each batch (as a numpy array)
+        gradient_kernels_batch = np.array(gradient_kernels_batch)
+
+        print('\ngradient_kernels_batch shape =', gradient_kernels_batch.shape)
+        self.gradient_kernels = np.sum(gradient_kernels_batch, axis=0)
+
+        # gradient bias (with if clause if input spatial dim is only 1)
+        if len(error_tensor.shape) == 3:
+            self.gradient_b = np.sum(self.output_of_forward, axis=(0, 2))
+        else:
+            self.gradient_b = np.sum(self.output_of_forward, axis=(0, 2, 3))
+        print('\ngradient kernels shape = ', self.gradient_kernels.shape, '\ngradient kernels\n', self.gradient_kernels)
+        if self.optimizer is not None:
+            self.weights = self.optimizer.calculate_update(self.weights, self.gradient_kernels)
+            self.bias = self.optimizer.calculate_update(self.bias, self.gradient_b)
+        return conv_array
 
     def initialize(self, weights_initializer, bias_initializer):
-        fan_in = self.weights.shape[1] * self.weights.shape[2] * self.weights.shape[3]
-        fan_out = self.num_kernels * self.weights.shape[2] * self.weights.shape[3]
-        self.weights = weights_initializer.initialize(self.weights.shape, fan_in, fan_out)
-        self.bias = bias_initializer.initialize(self.bias.shape, 1, self.weights.shape[0])
-        return self.weights, self.bias
+        self.weights = weights_initializer.initialize(self.weights.shape, self.convolution_shape[0] * self.convolution_shape[1] * self.convolution_shape[2],
+                                                      self.num_kernels * self.convolution_shape[1] * self.convolution_shape[2])
+        # the bias initialization is probably false
+        self.bias = bias_initializer.initialize(self.num_kernels, 0, 0)
 
     @property
     def gradient_weights(self):
-        return self._gradient_weights
-
-    @gradient_weights.setter
-    def gradient_weights(self, value):
-        self._gradient_weights = value
+        return self.gradient_kernels
 
     @property
     def gradient_bias(self):
-        return self._gradient_bias
+        return self.gradient_b
 
-    def gradient_bias(self, value):
-        self._gradient_bias = value
+    @property
     def optimizer(self):
         return self._optimizer
 
-    def optimizer(self, value):
-        self._optimizer = value
-
-    def bias_optimizer(self):
-        return self._bias_optimizer
-
-    def bias_optimizer(self, value):
-        self._bias_optimizer = value
-
+    @optimizer.setter
+    def optimizer(self, opt_function):
+        self._optimizer = opt_function
